@@ -2,6 +2,8 @@
 
 Minimal Linux tool for recording and transcribing audio with AI cleanup.
 
+![Screenshot](screenshot.png)
+
 ## Features
 - Global hotkey (Win+H) to toggle recording
 - Transcription via Groq Whisper API
