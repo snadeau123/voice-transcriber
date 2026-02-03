@@ -2,6 +2,7 @@
 
 import os
 import sys
+import shutil
 import tempfile
 import threading
 import subprocess
@@ -39,26 +40,35 @@ class SignalBridge(QObject):
 
 
 class AudioRecorder:
+    RECORDERS = [
+        ("pw-record", ["--format=s16", "--rate=16000", "--channels=1"]),
+        ("parecord", ["--format=s16le", "--rate=16000", "--channels=1", "--file-format=wav"]),
+        ("arecord", ["-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav"]),
+    ]
+
     def __init__(self):
         self.recording = False
         self.process = None
         self.output_file = None
+        self.recorder_cmd = self._detect_recorder()
+
+    def _detect_recorder(self):
+        for cmd, args in self.RECORDERS:
+            if shutil.which(cmd):
+                return (cmd, args)
+        return None
 
     def start(self):
+        if not self.recorder_cmd:
+            raise RuntimeError("No audio recorder found. Install pw-record, parecord, or arecord.")
         self.recording = True
         self.output_file = tempfile.NamedTemporaryFile(
             suffix=".wav", delete=False, prefix="voice_"
         )
         self.output_file.close()
+        cmd, args = self.recorder_cmd
         self.process = subprocess.Popen(
-            [
-                "parecord",
-                "--format=s16le",
-                "--rate=16000",
-                "--channels=1",
-                "--file-format=wav",
-                self.output_file.name
-            ],
+            [cmd] + args + [self.output_file.name],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
