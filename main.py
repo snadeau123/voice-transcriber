@@ -120,9 +120,10 @@ class GroqAPI:
 
 
 class TranscriberWindow(QMainWindow):
-    def __init__(self, signals: SignalBridge):
+    def __init__(self, signals: SignalBridge, tray_app=None):
         super().__init__()
         self.signals = signals
+        self.tray_app = tray_app
         self.recorder = AudioRecorder()
         self.api = GroqAPI(GROQ_API_KEY)
         self.current_audio_path = ""
@@ -259,7 +260,12 @@ class TranscriberWindow(QMainWindow):
         self.text_edit.setText(text)
         self.copy_btn.setEnabled(bool(text))
         self.cleanup_btn.setEnabled(bool(text))
-        self.status_label.setText("Transcription complete")
+        # Auto-copy to clipboard if enabled
+        if text and self.tray_app and self.tray_app.auto_copy_enabled:
+            QApplication.clipboard().setText(text)
+            self.status_label.setText("Transcription complete (copied to clipboard)")
+        else:
+            self.status_label.setText("Transcription complete")
 
     def on_cleanup_done(self, text: str):
         self.text_edit.setText(text)
@@ -375,14 +381,21 @@ class GlobalHotkeyListener:
 
 
 class SystemTrayApp:
-    def __init__(self, app: QApplication, window: TranscriberWindow):
+    def __init__(self, app: QApplication, window: TranscriberWindow, signals: SignalBridge):
         self.app = app
         self.window = window
+        self.signals = signals
         self.tray = QSystemTrayIcon()
+        self.auto_copy_enabled = False
+        self.normal_icon = None
+        self.recording_icon = None
+        self.setup_icons()
         self.setup_tray()
+        self.setup_signals()
 
-    def setup_tray(self):
+    def setup_icons(self):
         from PyQt6.QtGui import QPixmap, QPainter, QColor
+        # Normal icon (green)
         pixmap = QPixmap(32, 32)
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
@@ -390,7 +403,23 @@ class SystemTrayApp:
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(4, 4, 24, 24)
         painter.end()
-        self.tray.setIcon(QIcon(pixmap))
+        self.normal_icon = QIcon(pixmap)
+        # Recording icon (red)
+        pixmap_red = QPixmap(32, 32)
+        pixmap_red.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap_red)
+        painter.setBrush(QColor("#ff4444"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(4, 4, 24, 24)
+        painter.end()
+        self.recording_icon = QIcon(pixmap_red)
+
+    def setup_signals(self):
+        self.signals.recording_started.connect(self.on_recording_started)
+        self.signals.recording_stopped.connect(self.on_recording_stopped)
+
+    def setup_tray(self):
+        self.tray.setIcon(self.normal_icon)
         self.tray.setToolTip("Voice Transcriber")
         menu = QMenu()
         show_action = QAction("Show Window", menu)
@@ -400,12 +429,30 @@ class SystemTrayApp:
         record_action.triggered.connect(self.window.start_recording)
         menu.addAction(record_action)
         menu.addSeparator()
+        # Auto-copy toggle
+        self.auto_copy_action = QAction("Auto-copy to clipboard", menu)
+        self.auto_copy_action.setCheckable(True)
+        self.auto_copy_action.setChecked(self.auto_copy_enabled)
+        self.auto_copy_action.triggered.connect(self.toggle_auto_copy)
+        menu.addAction(self.auto_copy_action)
+        menu.addSeparator()
         quit_action = QAction("Quit", menu)
         quit_action.triggered.connect(self.quit_app)
         menu.addAction(quit_action)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
+
+    def toggle_auto_copy(self):
+        self.auto_copy_enabled = self.auto_copy_action.isChecked()
+
+    def on_recording_started(self):
+        self.tray.setIcon(self.recording_icon)
+        self.tray.setToolTip("Voice Transcriber - Recording...")
+
+    def on_recording_stopped(self, audio_path: str = ""):
+        self.tray.setIcon(self.normal_icon)
+        self.tray.setToolTip("Voice Transcriber")
 
     def show_window(self):
         self.window.show()
@@ -428,8 +475,10 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     signals = SignalBridge()
-    window = TranscriberWindow(signals)
-    tray = SystemTrayApp(app, window)
+    # Create window without tray first, then set it after tray is created
+    window = TranscriberWindow(signals, None)
+    tray = SystemTrayApp(app, window, signals)
+    window.tray_app = tray
     hotkey_listener = GlobalHotkeyListener(signals, window)
     hotkey_listener.start()
     window.show()
