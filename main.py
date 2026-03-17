@@ -9,6 +9,9 @@ import subprocess
 import signal
 from datetime import datetime
 
+import json
+import time
+
 import httpx
 from dotenv import load_dotenv
 from pynput import keyboard
@@ -25,6 +28,8 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL_GROQ", "whisper-large-v3-turbo")
 LLM_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+DEEPGRAM_MODEL = os.getenv("DEEPGRAM_MODEL", "nova-2")
 
 TOGGLE_HOTKEY = {keyboard.Key.cmd, keyboard.KeyCode.from_char('h')}
 
@@ -33,6 +38,7 @@ class SignalBridge(QObject):
     recording_started = pyqtSignal()
     recording_stopped = pyqtSignal(str)
     transcription_done = pyqtSignal(str)
+    transcript_interim = pyqtSignal(str)
     cleanup_done = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     status_update = pyqtSignal(str)
@@ -129,6 +135,92 @@ class GroqAPI:
         return result["choices"][0]["message"]["content"]
 
 
+class DeepgramStreamer:
+    """Streams audio to Deepgram for real-time transcription."""
+
+    def __init__(self, api_key: str, model: str, signals: SignalBridge):
+        import websocket as ws_module
+        self._ws_module = ws_module
+        self.api_key = api_key
+        self.model = model
+        self.signals = signals
+        self.ws = None
+        self._running = False
+        self._reader_thread = None
+        self._segments = []
+
+    def start(self):
+        url = (
+            f"wss://api.deepgram.com/v1/listen"
+            f"?model={self.model}"
+            f"&encoding=linear16"
+            f"&sample_rate=16000"
+            f"&channels=1"
+            f"&punctuate=true"
+            f"&interim_results=true"
+            f"&utterance_end_ms=1000"
+            f"&vad_events=true"
+        )
+        self.ws = self._ws_module.WebSocket()
+        self.ws.connect(url, header={"Authorization": f"Token {self.api_key}"})
+        self._running = True
+        self._segments = []
+        self._reader_thread = threading.Thread(target=self._read_responses, daemon=True)
+        self._reader_thread.start()
+
+    def send_audio(self, audio_bytes: bytes):
+        if self.ws and self._running:
+            try:
+                self.ws.send_binary(audio_bytes)
+            except Exception:
+                pass
+
+    def stop(self) -> str:
+        self._running = False
+        if self.ws:
+            try:
+                self.ws.send('{"type": "CloseStream"}')
+                time.sleep(0.5)
+            except Exception:
+                pass
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+        return " ".join(self._segments)
+
+    def _read_responses(self):
+        while self._running:
+            try:
+                result = self.ws.recv()
+                if not result:
+                    continue
+                msg = json.loads(result)
+                self._handle_message(msg)
+            except self._ws_module.WebSocketConnectionClosedException:
+                break
+            except Exception:
+                if not self._running:
+                    break
+                continue
+
+    def _handle_message(self, msg: dict):
+        if msg.get("type") != "Results":
+            return
+        channel = msg.get("channel", {})
+        alt = channel.get("alternatives", [{}])[0]
+        text = alt.get("transcript", "").strip()
+        if not text:
+            return
+        is_final = msg.get("is_final", False)
+        if is_final:
+            self._segments.append(text)
+            self.signals.transcript_interim.emit(" ".join(self._segments))
+        else:
+            self.signals.transcript_interim.emit(" ".join(self._segments + [text]))
+
+
 class TranscriberWindow(QMainWindow):
     def __init__(self, signals: SignalBridge, tray_app=None):
         super().__init__()
@@ -138,6 +230,8 @@ class TranscriberWindow(QMainWindow):
         self.api = GroqAPI(GROQ_API_KEY)
         self.current_audio_path = ""
         self.recording_start_time = None
+        self.deepgram = None
+        self._streaming = False
         self.setup_ui()
         self.setup_signals()
         self.setup_timer()
@@ -203,6 +297,7 @@ class TranscriberWindow(QMainWindow):
         self.signals.recording_started.connect(self.on_recording_started)
         self.signals.recording_stopped.connect(self.on_recording_stopped)
         self.signals.transcription_done.connect(self.on_transcription_done)
+        self.signals.transcript_interim.connect(self.on_transcript_interim)
         self.signals.cleanup_done.connect(self.on_cleanup_done)
         self.signals.error_occurred.connect(self.on_error)
         self.signals.status_update.connect(self.update_status)
@@ -220,26 +315,83 @@ class TranscriberWindow(QMainWindow):
 
     def start_recording(self):
         try:
+            self.text_edit.clear()
             self.recorder.start()
             self.recording_start_time = datetime.now()
             self.timer.start(100)
             self.signals.recording_started.emit()
+            if DEEPGRAM_API_KEY:
+                threading.Thread(target=self._start_deepgram_streaming, daemon=True).start()
         except Exception as e:
             self.signals.error_occurred.emit(f"Failed to start recording: {e}")
 
+    def _start_deepgram_streaming(self):
+        """Background thread: connect to Deepgram and stream audio from the growing WAV file."""
+        try:
+            self.deepgram = DeepgramStreamer(DEEPGRAM_API_KEY, DEEPGRAM_MODEL, self.signals)
+            self.deepgram.start()
+            self._streaming = True
+            self.signals.status_update.emit("Recording (live transcription)...")
+        except Exception as e:
+            self.deepgram = None
+            self._streaming = False
+            self.signals.status_update.emit("Live transcription unavailable")
+            return
+
+        file_path = self.recorder.output_file.name
+        time.sleep(0.2)
+        try:
+            with open(file_path, 'rb') as f:
+                # Skip WAV header (44 bytes)
+                header = b''
+                while len(header) < 44 and self._streaming:
+                    chunk = f.read(44 - len(header))
+                    if chunk:
+                        header += chunk
+                    else:
+                        time.sleep(0.05)
+                # Stream PCM data as it's written by the recorder
+                while self._streaming:
+                    chunk = f.read(4096)
+                    if chunk:
+                        self.deepgram.send_audio(chunk)
+                    else:
+                        time.sleep(0.05)
+                # Flush any remaining data after recording stops
+                while True:
+                    chunk = f.read(4096)
+                    if not chunk:
+                        break
+                    self.deepgram.send_audio(chunk)
+        except Exception:
+            pass
+
     def stop_recording(self):
         self.timer.stop()
+        self._streaming = False
         def do_stop():
             try:
                 audio_path = self.recorder.stop()
                 self.signals.recording_stopped.emit(audio_path)
-                if audio_path:
+                if self.deepgram:
+                    time.sleep(0.5)  # Let file streamer flush remaining audio
+                    final_text = self.deepgram.stop()
+                    self.deepgram = None
+                    if final_text:
+                        self.signals.transcription_done.emit(final_text)
+                    elif audio_path:
+                        # Deepgram produced nothing, fall back to Whisper
+                        self.signals.status_update.emit("Falling back to Whisper...")
+                        text = self.api.transcribe(audio_path)
+                        self.signals.transcription_done.emit(text)
+                elif audio_path:
                     self.signals.status_update.emit("Transcribing...")
                     text = self.api.transcribe(audio_path)
                     self.signals.transcription_done.emit(text)
+                if audio_path:
                     try:
                         os.unlink(audio_path)
-                    except:
+                    except Exception:
                         pass
             except Exception as e:
                 self.signals.error_occurred.emit(f"Error: {e}")
@@ -276,6 +428,9 @@ class TranscriberWindow(QMainWindow):
             self.status_label.setText("Transcription complete (copied to clipboard)")
         else:
             self.status_label.setText("Transcription complete")
+
+    def on_transcript_interim(self, text: str):
+        self.text_edit.setText(text)
 
     def on_cleanup_done(self, text: str):
         self.text_edit.setText(text)
